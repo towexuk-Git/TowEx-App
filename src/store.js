@@ -1,3 +1,4 @@
+import {invoiceBatchOverview,stageReportStatus} from './operations.js';
 /** A single Job Register drives every view. Local adapter is not multi-device sync. */
 export const STORAGE_KEY = 'towex.operations.v1';
 export const STATUSES = ['Booked','Awaiting availability','Scheduled','Confirmed','Appraisal','Awaiting buyer','Authorised','Collected','Delivered','On hold','Rejected','Cancelled'];
@@ -5,20 +6,53 @@ export const ACTIVE_STATUSES = STATUSES.filter(x => !['Delivered','Rejected','Ca
 export const CLIENTS = ['A&R Automobiles','GCS Cars','Stellantis','SWS Commercials','Prestige AV','Endeavour','Waylands Volvo','Auto Planet','Other'];
 export const DRIVERS = ['Unassigned','Driver 1','Driver 2','Driver 3','Driver 4','Driver 5','Driver 6'];
 export function uid(prefix='TXJ') {return `${prefix}-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2,7).toUpperCase()}`;}
-export function blankState(){return {schemaVersion:1,updatedAt:new Date().toISOString(),jobs:[],invoices:[],history:[]};}
-export function blankJob(){return {id:uid(),registration:'',vehicle:'',client:'',pickup:'',dropoff:'',collectionDate:'',deliveryDate:'',driver:'Unassigned',status:'Booked',serviceLevel:'standard',movementType:'delivery',billableMiles:'',driverMiles:'',manualFee:'',preNegotiatedPrice:'',negotiatedPrice:'',fuelCost:'',electricityCost:'',otherExpenses:'',evMinutes:'',chargeNegotiation:false,chargeAppraisal:false,chargeHandover:false,notes:'',invoiceId:'',createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};}
+export function blankState(){return {schemaVersion:1,updatedAt:new Date().toISOString(),jobs:[],invoices:[],history:[],defaultInvoiceThreshold:3,invoiceThresholds:{}};}
+export function blankJob(){return {id:uid(),registration:'',vehicle:'',client:'',pickup:'',dropoff:'',collectionDate:'',deliveryDate:'',driver:'Unassigned',status:'Booked',serviceLevel:'standard',movementType:'delivery',billableMiles:'',driverMiles:'',manualFee:'',preNegotiatedPrice:'',negotiatedPrice:'',fuelCost:'',electricityCost:'',otherExpenses:'',evMinutes:'',chargeNegotiation:false,chargeAppraisal:false,chargeHandover:false,notes:'',conditionReports:{},invoiceId:'',createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};}
 export function validState(x){return !!x && x.schemaVersion===1 && Array.isArray(x.jobs) && Array.isArray(x.invoices) && Array.isArray(x.history) && x.jobs.every(j=>j&&typeof j.id==='string'&&typeof j.status==='string');}
 export function loadState(){try{const s=JSON.parse(localStorage.getItem(STORAGE_KEY));if(validState(s))return s;}catch{} return blankState();}
 export function saveState(s){if(!validState(s))throw new Error('Invalid register format'); s.updatedAt=new Date().toISOString();localStorage.setItem(STORAGE_KEY,JSON.stringify(s));window.dispatchEvent(new CustomEvent('towex:changed'));return s;}
-export function changeJob(s,job,who='Operator') {const now=new Date().toISOString();const old=s.jobs.find(x=>x.id===job.id);const next={...blankJob(),...old,...job,updatedAt:now}; if(old){s.jobs=s.jobs.map(j=>j.id===job.id?next:j);}else{s.jobs.push(next);} s.history.unshift({id:uid('EVENT'),jobId:next.id,at:now,actor:who,action:old?'updated':'created',before:old?.status||null,after:next.status});return saveState(s);}
-export function updateStatus(s,id,status,who='Operator'){if(!STATUSES.includes(status))throw new Error('Unknown status');const j=s.jobs.find(x=>x.id===id);if(!j)throw new Error('Job not found');return changeJob(s,{...j,status},who);}
+export function changeJob(s,job,who='Operator') {const now=new Date().toISOString();const old=s.jobs.find(x=>x.id===job.id);const next={...blankJob(),...old,...job,updatedAt:now}; if(old){s.jobs=s.jobs.map(j=>j.id===job.id?next:j);}else{s.jobs.push(next);} s.history.unshift({id:uid('EVENT'),jobId:next.id,at:now,actor:who,action:old?'updated':'created',before:old?.status||null,after:next.status}); if(next.status==='Delivered')autoDraftInvoices(s);return saveState(s);}
+export function updateStatus(s,id,status,who='Operator'){if(!STATUSES.includes(status))throw new Error('Unknown status');const j=s.jobs.find(x=>x.id===id);if(!j)throw new Error('Job not found');if(status==='Collected'&&!stageReportStatus(j,'collection'))throw new Error('Save the collection condition report and photos first');if(status==='Delivered'&&!stageReportStatus(j,'delivery'))throw new Error('Save the delivery condition report and photos first');return changeJob(s,{...j,status},who);}
 export function removeJob(s,id){const j=s.jobs.find(x=>x.id===id);if(!j)return s;if(j.invoiceId)throw new Error('Cannot delete an invoice-linked job'); s.jobs=s.jobs.filter(x=>x.id!==id); s.history.unshift({id:uid('EVENT'),jobId:id,at:new Date().toISOString(),actor:'Operator',action:'deleted',before:j.status,after:null});return saveState(s);}
 export function activeJobs(s){return s.jobs.filter(j=>ACTIVE_STATUSES.includes(j.status));}
 export function dispatchJobs(s){return activeJobs(s).sort((a,b)=> (a.collectionDate||'9999').localeCompare(b.collectionDate||'9999') || a.client.localeCompare(b.client));}
 export function driverJobs(s,driver){return activeJobs(s).filter(j=>j.driver===driver);}
 export function invoiceCandidates(s,client){const drafted=new Set(s.invoices.filter(i=>i.status==='Draft').flatMap(i=>i.jobIds));return s.jobs.filter(j=>j.client===client && j.status==='Delivered' && !j.invoiceId && !drafted.has(j.id));}
+export function autoDraftInvoices(s){
+ const groups=invoiceBatchOverview(s);
+ for(const group of groups.filter(g=>g.ready)){
+   const id=uid('TXI');
+   s.invoices.unshift({id,number:`DRAFT-${id}`,client:group.client,jobIds:group.jobIds,issueDate:'',dueDate:'',status:'Draft',createdAt:new Date().toISOString(),autoGenerated:true});
+   s.history.unshift({id:uid('EVENT'),at:new Date().toISOString(),actor:'System',action:`batched draft for ${group.client} (${group.count} delivered jobs)`,jobId:group.jobIds.join(',')});
+ }
+ return s;
+}
+export function setInvoiceThreshold(s,client,threshold){
+ const n=Number(threshold);if(![2,3].includes(n))throw new Error('Invoice batch size must be 2 or 3');
+ if(client){s.invoiceThresholds||={};s.invoiceThresholds[client]=n;}else s.defaultInvoiceThreshold=n;
+ autoDraftInvoices(s);return saveState(s);
+}
+export function renameInvoice(s,id,number){
+ const i=s.invoices.find(x=>x.id===id);if(!i||i.status!=='Draft')throw new Error('Only draft invoices can be numbered');
+ const trimmed=String(number||'').trim();if(!/^TX-\d{4,}$/i.test(trimmed))throw new Error('Use a TowEx invoice number such as TX-0155');
+ if(s.invoices.some(x=>x.id!==id&&x.number.toLowerCase()===trimmed.toLowerCase()))throw new Error('Invoice number already in use');
+ i.number=trimmed.toUpperCase();return saveState(s);
+}
+export function saveConditionReport(s,jobId,stage,report,actor='Operator'){
+ if(!['collection','delivery'].includes(stage))throw new Error('Invalid inspection stage');
+ const j=s.jobs.find(x=>x.id===jobId);if(!j)throw new Error('Job not found');
+ const damages=(report.damages||[]).map(x=>({zone:String(x.zone||''),severity:String(x.severity||'Noted'),note:String(x.note||'')}));
+ const photos=(report.photos||[]).slice(0,4).map(x=>({name:String(x.name||''),dataUrl:String(x.dataUrl||'')}));
+ if(photos.some(x=>!/^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(x.dataUrl)))throw new Error('Unsupported photograph format');
+ if(!photos.length)throw new Error('Add at least one vehicle photograph for this report');
+ const previous=j.conditionReports?.[stage];const now=new Date().toISOString();
+ j.conditionReports={...(j.conditionReports||{}),[stage]:{...report,damages,photos,completedAt:now,actor}};
+ j.updatedAt=now;
+ s.history.unshift({id:uid('EVENT'),jobId,at:now,actor,action:`${stage} condition report ${previous?'updated':'created'}`});
+ return saveState(s);
+}
 export function createInvoice(s,client,jobIds,invoiceNumber){if(!client||!invoiceNumber.trim())throw new Error('Client and invoice number required');if(s.invoices.some(i=>i.number.toLowerCase()===invoiceNumber.trim().toLowerCase()))throw new Error('Invoice number already exists');const candidate=invoiceCandidates(s,client);const allowed=candidate.filter(j=>jobIds.includes(j.id));if(!allowed.length || allowed.length!==jobIds.length)throw new Error('Select delivered, uninvoiced jobs for one client');const invoice={id:uid('TXI'),number:invoiceNumber.trim(),client,jobIds,issueDate:'',dueDate:'',status:'Draft',createdAt:new Date().toISOString()};s.invoices.unshift(invoice);s.history.unshift({id:uid('EVENT'),at:new Date().toISOString(),actor:'Operator',action:`invoice draft ${invoice.number}`,jobId:jobIds.join(',')});return saveState(s);}
-export function issueInvoice(s,id){const i=s.invoices.find(x=>x.id===id);if(!i||i.status!=='Draft')throw new Error('Only draft invoices may be issued');i.status='Issued';i.issueDate=new Date().toISOString().slice(0,10);i.dueDate=''; // Enter payment due date after accounting for bank holidays.
+export function issueInvoice(s,id){const i=s.invoices.find(x=>x.id===id);if(!i||i.status!=='Draft')throw new Error('Only draft invoices may be issued');if(i.number.startsWith('DRAFT-'))throw new Error('Assign a real invoice number before issuing');i.status='Issued';i.issueDate=new Date().toISOString().slice(0,10);i.dueDate=''; // Enter payment due date after accounting for bank holidays.
  i.lockedJobs=i.jobIds.map(jobId=>structuredClone(s.jobs.find(x=>x.id===jobId))).filter(Boolean);for(const jobId of i.jobIds){const j=s.jobs.find(x=>x.id===jobId);if(j)j.invoiceId=i.id;} s.history.unshift({id:uid('EVENT'),at:new Date().toISOString(),actor:'Operator',action:`invoice issued ${i.number}`,jobId:i.jobIds.join(',')});return saveState(s);}
 export function markPaid(s,id){const i=s.invoices.find(x=>x.id===id);if(!i||i.status!=='Issued')throw new Error('Only issued invoices can be paid');i.status='Paid';return saveState(s);}
 export function importRegister(s,mode='replace') {if(!validState(s))throw new Error('Unsupported JSON schema. Use the exported TowEx register format.');if(mode==='replace')return saveState(s);throw new Error('Unsupported import mode');}
