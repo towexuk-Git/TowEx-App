@@ -1,0 +1,14 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {movementFee,jobCharges,invoiceTotal} from '../src/pricing.js';
+const j = (props={})=>({client:'A&R Automobiles',billableMiles:0,serviceLevel:'standard',movementType:'delivery',...props});
+test('standard minimum through 60 miles',()=>{assert.equal(movementFee(j({billableMiles:0})),80);assert.equal(movementFee(j({billableMiles:60})),80);});
+test('standard 80 base plus mileage after 60',()=>assert.equal(movementFee(j({billableMiles:205})),225));
+test('urgent 100 base, £1.20 beyond 60',()=>assert.equal(movementFee(j({billableMiles:110,serviceLevel:'urgent'})),160));
+test('Stellantis has uniform standard rate even urgent',()=>assert.equal(movementFee(j({client:'Stellantis',billableMiles:205,serviceLevel:'urgent'})),225));
+test('Stellantis handover not charged',()=>assert.equal(jobCharges(j({client:'Stellantis',chargeHandover:true})).handover,0));
+test('management movement flat 80',()=>assert.equal(movementFee(j({movementType:'management',billableMiles:400})),80));
+test('manual override overrides other logic',()=>assert.equal(movementFee(j({manualFee:123.75})),123.75));
+test('negotiation 20% saving + expenses + 20/hr',()=>{const c=jobCharges(j({billableMiles:60,preNegotiatedPrice:6500,negotiatedPrice:5500,chargeNegotiation:true,evMinutes:40,electricityCost:27.67}));assert.equal(c.negotiation,200);assert.equal(c.evTime,13.33);assert.equal(c.expenses,27.67);assert.equal(c.subtotal,321);});
+test('no negative saving fee',()=>assert.equal(jobCharges(j({preNegotiatedPrice:1,negotiatedPrice:2,chargeNegotiation:true})).negotiation,0));
+test('invoice totals priced jobs',()=>assert.equal(invoiceTotal([j({billableMiles:205}),j({billableMiles:117})]),362));
