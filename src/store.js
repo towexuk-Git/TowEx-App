@@ -1,4 +1,5 @@
 import {invoiceBatchOverview,stageReportStatus} from './operations.js';
+import {createSchedulePlan,reviewSchedule,sourceSignature} from './schedule-plans.js';
 /** A single Job Register drives every view. Local adapter is not multi-device sync. */
 export const STORAGE_KEY = 'towex.operations.v1';
 export const STATUSES = ['Booked','Awaiting availability','Scheduled','Confirmed','Appraisal','Awaiting buyer','Authorised','Collected','Delivered','On hold','Rejected','Cancelled'];
@@ -6,14 +7,14 @@ export const ACTIVE_STATUSES = STATUSES.filter(x => !['Delivered','Rejected','Ca
 export const CLIENTS = ['A&R Automobiles','GCS Cars','Stellantis','SWS Commercials','Prestige AV','Endeavour','Waylands Volvo','Auto Planet','Other'];
 export const DRIVERS = ['Unassigned','Driver 1','Driver 2','Driver 3','Driver 4','Driver 5','Driver 6'];
 export function uid(prefix='TXJ') {return `${prefix}-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2,7).toUpperCase()}`;}
-export function blankState(){return {schemaVersion:1,updatedAt:new Date().toISOString(),jobs:[],invoices:[],history:[],defaultInvoiceThreshold:3,invoiceThresholds:{}};}
+export function blankState(){return {schemaVersion:1,updatedAt:new Date().toISOString(),jobs:[],invoices:[],history:[],defaultInvoiceThreshold:3,invoiceThresholds:{},schedulePlans:[]};}
 export function blankJob(){return {id:uid(),registration:'',vehicle:'',client:'',pickup:'',dropoff:'',collectionDate:'',deliveryDate:'',driver:'Unassigned',status:'Booked',serviceLevel:'standard',movementType:'delivery',billableMiles:'',driverMiles:'',manualFee:'',preNegotiatedPrice:'',negotiatedPrice:'',fuelCost:'',electricityCost:'',otherExpenses:'',evMinutes:'',chargeNegotiation:false,chargeAppraisal:false,chargeHandover:false,notes:'',conditionReports:{},invoiceId:'',createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};}
-export function validState(x){return !!x && x.schemaVersion===1 && Array.isArray(x.jobs) && Array.isArray(x.invoices) && Array.isArray(x.history) && x.jobs.every(j=>j&&typeof j.id==='string'&&typeof j.status==='string');}
-export function loadState(){try{const s=JSON.parse(localStorage.getItem(STORAGE_KEY));if(validState(s))return s;}catch{} return blankState();}
+export function validState(x){return !!x && x.schemaVersion===1 && Array.isArray(x.jobs) && Array.isArray(x.invoices) && Array.isArray(x.history) && (x.schedulePlans===undefined||Array.isArray(x.schedulePlans)) && x.jobs.every(j=>j&&typeof j.id==='string'&&typeof j.status==='string');}
+export function loadState(){try{const s=JSON.parse(localStorage.getItem(STORAGE_KEY));if(validState(s))return {...s,schedulePlans:s.schedulePlans||[]};}catch{} return blankState();}
 export function saveState(s){if(!validState(s))throw new Error('Invalid register format'); s.updatedAt=new Date().toISOString();localStorage.setItem(STORAGE_KEY,JSON.stringify(s));window.dispatchEvent(new CustomEvent('towex:changed'));return s;}
-export function changeJob(s,job,who='Operator') {const now=new Date().toISOString();const old=s.jobs.find(x=>x.id===job.id);const next={...blankJob(),...old,...job,updatedAt:now}; if(old){s.jobs=s.jobs.map(j=>j.id===job.id?next:j);}else{s.jobs.push(next);} s.history.unshift({id:uid('EVENT'),jobId:next.id,at:now,actor:who,action:old?'updated':'created',before:old?.status||null,after:next.status}); if(next.status==='Delivered')autoDraftInvoices(s);return saveState(s);}
+export function changeJob(s,job,who='Operator') {const now=new Date().toISOString();const old=s.jobs.find(x=>x.id===job.id);const next={...blankJob(),...old,...job,updatedAt:now}; if(old){s.jobs=s.jobs.map(j=>j.id===job.id?next:j);}else{s.jobs.push(next);} s.history.unshift({id:uid('EVENT'),jobId:next.id,at:now,actor:who,action:old?'updated':'created',before:old?.status||null,after:next.status}); if(next.status==='Delivered')autoDraftInvoices(s);invalidateChangedSchedules(s);return saveState(s);}
 export function updateStatus(s,id,status,who='Operator'){if(!STATUSES.includes(status))throw new Error('Unknown status');const j=s.jobs.find(x=>x.id===id);if(!j)throw new Error('Job not found');if(status==='Collected'&&!stageReportStatus(j,'collection'))throw new Error('Save the collection condition report and photos first');if(status==='Delivered'&&!stageReportStatus(j,'delivery'))throw new Error('Save the delivery condition report and photos first');return changeJob(s,{...j,status},who);}
-export function removeJob(s,id){const j=s.jobs.find(x=>x.id===id);if(!j)return s;if(j.invoiceId)throw new Error('Cannot delete an invoice-linked job'); s.jobs=s.jobs.filter(x=>x.id!==id); s.history.unshift({id:uid('EVENT'),jobId:id,at:new Date().toISOString(),actor:'Operator',action:'deleted',before:j.status,after:null});return saveState(s);}
+export function removeJob(s,id){const j=s.jobs.find(x=>x.id===id);if(!j)return s;if(j.invoiceId)throw new Error('Cannot delete an invoice-linked job'); s.jobs=s.jobs.filter(x=>x.id!==id); s.history.unshift({id:uid('EVENT'),jobId:id,at:new Date().toISOString(),actor:'Operator',action:'deleted',before:j.status,after:null});invalidateChangedSchedules(s);return saveState(s);}
 export function activeJobs(s){return s.jobs.filter(j=>ACTIVE_STATUSES.includes(j.status));}
 export function dispatchJobs(s){return activeJobs(s).sort((a,b)=> (a.collectionDate||'9999').localeCompare(b.collectionDate||'9999') || a.client.localeCompare(b.client));}
 export function driverJobs(s,driver){return activeJobs(s).filter(j=>j.driver===driver);}
@@ -56,3 +57,44 @@ export function issueInvoice(s,id){const i=s.invoices.find(x=>x.id===id);if(!i||
  i.lockedJobs=i.jobIds.map(jobId=>structuredClone(s.jobs.find(x=>x.id===jobId))).filter(Boolean);for(const jobId of i.jobIds){const j=s.jobs.find(x=>x.id===jobId);if(j)j.invoiceId=i.id;} s.history.unshift({id:uid('EVENT'),at:new Date().toISOString(),actor:'Operator',action:`invoice issued ${i.number}`,jobId:i.jobIds.join(',')});return saveState(s);}
 export function markPaid(s,id){const i=s.invoices.find(x=>x.id===id);if(!i||i.status!=='Issued')throw new Error('Only issued invoices can be paid');i.status='Paid';return saveState(s);}
 export function importRegister(s,mode='replace') {if(!validState(s))throw new Error('Unsupported JSON schema. Use the exported TowEx register format.');if(mode==='replace')return saveState(s);throw new Error('Unsupported import mode');}
+
+/** Admin-controlled scheduling prototype. Production permissions MUST be enforced server-side. */
+function scheduleHistory(s,plan,actor,action){s.history.unshift({id:uid('EVENT'),at:new Date().toISOString(),actor,action:`schedule ${action}: ${plan.driver} ${plan.date}`,jobId:plan.stops.map(x=>x.jobId).join(',')});}
+function findPlan(s,id){const p=(s.schedulePlans||[]).find(x=>x.id===id);if(!p)throw new Error('Schedule plan not found');return p;}
+export function latestSchedule(s,driver,date){return (s.schedulePlans||[]).filter(p=>p.driver===driver&&p.date===date&&p.status!=='Superseded').at(-1)||null;}
+export function saveDraftSchedule(s,driver,date){
+ s.schedulePlans||=[];const old=latestSchedule(s,driver,date);
+ if(old&&old.status!=='Released'&&old.status!=='Needs revision'&&old.status!=='Superseded')throw new Error('This day already has a draft. Edit the existing plan instead.');
+ if(old)old.status='Superseded';
+ const plan=createSchedulePlan(s,driver,date,uid('RUN'));
+ s.schedulePlans.push(plan);scheduleHistory(s,plan,'Operator','draft created');return saveState(s);
+}
+export function amendSchedule(s,id,changes){
+ const plan=findPlan(s,id);if(plan.status==='Released'||plan.status==='Superseded')throw new Error('Released schedules are locked. Create a revised draft instead.');
+ const allowed=['origin','shiftStart','maxShiftHours','routeMode','relayNotes','relayChecked','stops'];
+ for(const k of Object.keys(changes))if(!allowed.includes(k))throw new Error('Cannot edit schedule metadata');
+ if(changes.stops&&(!Array.isArray(changes.stops)||changes.stops.length!==plan.stops.length))throw new Error('Invalid stop list');
+ Object.assign(plan,structuredClone(changes));plan.status='Draft';plan.approvedBy='';plan.approvedAt='';plan.approvedSource=null;plan.releasedAt='';plan.updatedAt=new Date().toISOString();
+ scheduleHistory(s,plan,'Operator','edited — approval reset');return saveState(s);
+}
+export function submitSchedule(s,id){const plan=findPlan(s,id);if(plan.status!=='Draft')throw new Error('Only drafts can be submitted for review');plan.status='Pending approval';scheduleHistory(s,plan,'Operator','submitted for approval');return saveState(s);}
+function demandAdmin(actor){if(actor?.role!=='admin'||!String(actor.name||'').trim())throw new Error('Admin authority required to approve or release');}
+export function approveSchedule(s,id,actor){
+ demandAdmin(actor);const plan=findPlan(s,id);if(plan.status!=='Pending approval')throw new Error('Schedule must be submitted for admin review first');
+ const check=reviewSchedule(s,plan);if(check.errors.length)throw new Error(`Cannot approve: ${check.errors.join(' ')}`);
+ plan.status='Approved';plan.approvedBy=actor.name;plan.approvedAt=new Date().toISOString();plan.approvedSource=sourceSignature(s,plan.driver,plan.date);
+ scheduleHistory(s,plan,actor.name,'approved');return saveState(s);
+}
+export function releaseSchedule(s,id,actor){
+ demandAdmin(actor);const plan=findPlan(s,id);if(plan.status!=='Approved'||!plan.approvedAt)throw new Error('Admin approval is required before release');
+ const check=reviewSchedule(s,plan);if(check.errors.length||plan.approvedSource!==sourceSignature(s,plan.driver,plan.date))throw new Error('Plan changed since approval. Rebuild and reapprove.');
+ plan.status='Released';plan.releasedBy=actor.name;plan.releasedAt=new Date().toISOString();scheduleHistory(s,plan,actor.name,'released');return saveState(s);
+}
+export function invalidateChangedSchedules(s){
+ for(const p of s.schedulePlans||[]){
+  if(['Draft','Pending approval','Approved','Released'].includes(p.status)&&p.sourceAtCreation!==sourceSignature(s,p.driver,p.date)){
+   p.status='Needs revision';p.approvedBy='';p.approvedAt='';p.approvedSource=null;
+   scheduleHistory(s,p,'System','needs revision because Job Register changed');
+  }
+ }
+}
